@@ -11,6 +11,15 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
+
+# Guard against Colab's pre-installed torchao version mismatch with diffusers
+try:
+    import torchao.quantization as _tao_quant
+    if not hasattr(_tao_quant, "FqnToConfig"):
+        _tao_quant.FqnToConfig = dict
+except Exception:
+    pass
+
 from diffusers import DiffusionPipeline
 from diffusers.utils import export_to_video
 
