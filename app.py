@@ -51,6 +51,7 @@ def run_generation_pipeline(
     use_expander: bool,
     api_key: str,
     llm_provider: str,
+    progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[str, str, str]:
     """
     1. Optionally expands the prompt via SceneDirector (with graceful fallback).
@@ -61,6 +62,7 @@ def run_generation_pipeline(
         raise gr.Error("Please enter a scene description prompt.")
 
     t0 = time.time()
+    progress(0.02, desc="Preparing prompt...")
     final_prompt = director.enhance_prompt(
         prompt=prompt,
         use_enhancer=use_expander,
@@ -78,6 +80,7 @@ def run_generation_pipeline(
         fps=int(fps),
         guidance_scale=float(guidance_scale),
         seed=int(seed),
+        progress_callback=progress,
     )
 
     elapsed = time.time() - t0
