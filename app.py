@@ -201,7 +201,6 @@ def build_ui() -> gr.Blocks:
                 video_output = gr.Video(
                     label="Generated Video (.mp4)",
                     format="mp4",
-                    show_download_button=True,
                     interactive=False,
                 )
                 expanded_prompt_output = gr.Textbox(
