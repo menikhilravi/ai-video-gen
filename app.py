@@ -6,8 +6,13 @@ using Wan2.1-1.3B-T2V and Lightricks/LTX-Video with optional LLM scene expansion
 
 import argparse
 import logging
+import os
 import time
-from typing import Tuple
+from typing import Optional, Tuple
+
+# Disable Gradio external telemetry & analytics pings
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 import gradio as gr
 
@@ -95,7 +100,7 @@ def run_generation_pipeline(
 def build_ui() -> gr.Blocks:
     model_choices = list(MODEL_REGISTRY.keys())
 
-    with gr.Blocks(title="Zero-Cost AI Video Studio") as demo:
+    with gr.Blocks(title="Zero-Cost AI Video Studio", analytics_enabled=False) as demo:
         gr.Markdown(
             """
             # Zero-Cost AI Video Studio
@@ -250,14 +255,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--share", action="store_true", help="Create a public Gradio share tunnel")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server bind address")
     parser.add_argument("--port", type=int, default=7860, help="Server port")
+    parser.add_argument(
+        "--auth",
+        type=str,
+        default=os.environ.get("GRADIO_AUTH", ""),
+        help="Optional username:password to lock the Gradio UI (e.g., --auth admin:secret123)",
+    )
     return parser.parse_args()
+
+
+def _parse_auth(auth_str: str) -> Optional[Tuple[str, str]]:
+    cleaned = (auth_str or "").strip()
+    if not cleaned:
+        return None
+    if ":" not in cleaned:
+        raise ValueError("--auth must be in 'username:password' format (e.g., --auth nikhil:mysecret)")
+    user, pwd = cleaned.split(":", 1)
+    return user.strip(), pwd.strip()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    auth_tuple = _parse_auth(args.auth)
     app = build_ui()
     app.queue().launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        auth=auth_tuple,
+        show_api=False,
     )
