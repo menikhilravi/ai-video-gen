@@ -98,6 +98,19 @@ class VideoGenerationEngine:
         self.device, self.dtype = detect_compute_backend()
         self.current_model_key: Optional[str] = None
         self.pipe: Optional[DiffusionPipeline] = None
+        self.low_system_ram: bool = self._detect_low_system_ram()
+
+    @staticmethod
+    def _detect_low_system_ram() -> bool:
+        try:
+            import os as _os
+            total_ram_gb = (
+                _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+            ) / (1024**3)
+            logger.info("Detected Host System RAM: %.1f GB", total_ram_gb)
+            return total_ram_gb < 16.0
+        except Exception:
+            return False
 
     def _unload_current_pipeline(self) -> None:
         if self.pipe is not None:
@@ -110,7 +123,7 @@ class VideoGenerationEngine:
                 torch.cuda.empty_cache()
 
     def load_pipeline(self, model_key: str) -> DiffusionPipeline:
-        """Loads and configures the requested video diffusion pipeline with VRAM optimizations."""
+        """Loads and configures the requested video diffusion pipeline with VRAM/RAM optimizations."""
         if model_key not in MODEL_REGISTRY:
             raise ValueError(
                 f"Unsupported model '{model_key}'. Available: {list(MODEL_REGISTRY.keys())}"
@@ -122,40 +135,21 @@ class VideoGenerationEngine:
         self._unload_current_pipeline()
         spec = MODEL_REGISTRY[model_key]
         logger.info(
-            "Loading %s (%s) on %s with dtype=%s...",
+            "Loading %s (%s) on %s with dtype=%s (low_system_ram=%s)...",
             spec.display_name,
             spec.repo_id,
             self.device,
             self.dtype,
+            self.low_system_ram,
         )
 
-        # Check available system RAM (Colab free tier only provides ~12.7 GB system RAM,
-        # whereas Wan2.1's UMT5-XXL text encoder (9.5 GB) + DiT (2.8 GB) + VAE (0.3 GB) = 12.6 GB in fp16,
-        # which triggers the Linux OOM killer if all components reside in CPU RAM simultaneously).
-        total_ram_gb = 32.0
-        try:
-            import os as _os
-            total_ram_gb = (
-                _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
-            ) / (1024**3)
-        except Exception:
-            pass
-
-        logger.info("Detected System RAM: %.1f GB", total_ram_gb)
-
-        if self.device == "cuda" and total_ram_gb < 16.0:
-            # Colab Free Tier only has 12.7 GB System RAM, whereas Wan2.1's UMT5-XXL (9.5 GB)
-            # + DiT (2.8 GB) + VAE (0.3 GB) = 12.6 GB total. Loading all three into System RAM
-            # at once triggers Linux's OOM killer ("Connection to the server was lost").
-            # Solution: Load pipeline WITHOUT text_encoder first, move DiT + VAE to T4 VRAM (3.1 GB),
-            # then load the 9.5 GB text_encoder into CPU RAM so System RAM never exceeds ~10 GB!
-            logger.info(
-                "Colab Low-RAM Mode (%.1f GB System RAM): Staged loading across T4 VRAM + System RAM "
-                "to prevent host OOM kills...",
-                total_ram_gb,
-            )
-            from transformers import AutoModel, UMT5EncoderModel, T5EncoderModel
-
+        if self.device == "cuda" and self.low_system_ram:
+            # Colab Free Tier only provides ~12.7 GB System RAM, and Wan2.1's UMT5-XXL
+            # text encoder alone is ~10-11 GB in fp16, which triggers the Linux OOM killer
+            # if loaded into CPU RAM alongside Python/Gradio (~2 GB).
+            # Solution: Keep ONLY the lightweight DiT (2.8 GB) + VAE (0.3 GB) in the persistent
+            # pipeline on T4 VRAM, and stream the text encoder directly onto T4 VRAM ONLY during
+            # the 1-second prompt encoding step! Peak CPU RAM stays under ~2.5 GB!
             pipe = DiffusionPipeline.from_pretrained(
                 spec.repo_id,
                 text_encoder=None,
@@ -166,28 +160,7 @@ class VideoGenerationEngine:
                 pipe.transformer.to("cuda")
             if hasattr(pipe, "vae") and pipe.vae is not None:
                 pipe.vae.to("cuda")
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Now System RAM is completely free (~1.5 GB used); safely load the 9.5 GB text encoder on CPU
-            encoder_cls = UMT5EncoderModel if "Wan" in spec.repo_id else T5EncoderModel
-            try:
-                text_encoder = encoder_cls.from_pretrained(
-                    spec.repo_id,
-                    subfolder="text_encoder",
-                    torch_dtype=self.dtype,
-                    low_cpu_mem_usage=True,
-                )
-            except Exception:
-                text_encoder = AutoModel.from_pretrained(
-                    spec.repo_id,
-                    subfolder="text_encoder",
-                    torch_dtype=self.dtype,
-                    low_cpu_mem_usage=True,
-                )
-            pipe.register_modules(text_encoder=text_encoder)
         else:
-            # Standard load when System RAM >= 16 GB
             pipe = DiffusionPipeline.from_pretrained(
                 spec.repo_id,
                 torch_dtype=self.dtype,
@@ -219,6 +192,70 @@ class VideoGenerationEngine:
         self.current_model_key = model_key
         return pipe
 
+    def _encode_prompt_low_ram(
+        self,
+        pipe: DiffusionPipeline,
+        spec: ModelSpec,
+        prompt: str,
+        negative_prompt: str,
+        guidance_scale: float,
+    ):
+        """
+        Loads the text_encoder directly into T4 GPU VRAM (device_map={'': 'cuda'}),
+        computes prompt embeddings in ~1 second, and immediately purges the text_encoder
+        from VRAM so CPU RAM never spikes and GPU VRAM is freed for denoising.
+        """
+        from transformers import AutoModel, T5EncoderModel, UMT5EncoderModel
+
+        # Temporarily move transformer to CPU (only 2.8 GB, easily fits in 12.7 GB CPU RAM)
+        # while the 9.5 GB text encoder uses the 14.6 GB T4 GPU!
+        if hasattr(pipe, "transformer") and pipe.transformer is not None:
+            pipe.transformer.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        logger.info("Loading text_encoder directly onto GPU VRAM to avoid CPU RAM OOM...")
+        encoder_cls = UMT5EncoderModel if "Wan" in spec.repo_id else T5EncoderModel
+        try:
+            text_encoder = encoder_cls.from_pretrained(
+                spec.repo_id,
+                subfolder="text_encoder",
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
+                device_map={"": "cuda"},
+            )
+        except Exception:
+            text_encoder = AutoModel.from_pretrained(
+                spec.repo_id,
+                subfolder="text_encoder",
+                torch_dtype=self.dtype,
+                low_cpu_mem_usage=True,
+                device_map={"": "cuda"},
+            )
+
+        pipe.text_encoder = text_encoder
+        with torch.inference_mode():
+            prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=float(guidance_scale) > 1.0,
+                device=torch.device("cuda"),
+                dtype=self.dtype,
+            )
+
+        # Immediately purge text_encoder from GPU VRAM and move DiT back to GPU
+        pipe.text_encoder = None
+        del text_encoder
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if hasattr(pipe, "transformer") and pipe.transformer is not None:
+            pipe.transformer.to("cuda")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return prompt_embeds, negative_prompt_embeds
+
     def generate_video(
         self,
         prompt: str,
@@ -243,7 +280,7 @@ class VideoGenerationEngine:
 
         spec = MODEL_REGISTRY[model_key]
         if progress_callback is not None:
-            progress_callback(0.05, desc=f"Loading {spec.display_name} weights...")
+            progress_callback(0.05, desc=f"Loading {spec.display_name} pipeline...")
         pipe = self.load_pipeline(model_key)
 
         effective_width = align_spatial_dim(width, spec.spatial_multiple)
@@ -274,7 +311,7 @@ class VideoGenerationEngine:
 
         def _on_step_end(_pipe, step_index: int, _timestep, callback_kwargs):
             if progress_callback is not None:
-                frac = 0.1 + 0.8 * ((step_index + 1) / max(1, total_steps))
+                frac = 0.15 + 0.75 * ((step_index + 1) / max(1, total_steps))
                 progress_callback(
                     min(0.92, frac),
                     desc=f"Denoising step {step_index + 1}/{total_steps}...",
@@ -282,14 +319,12 @@ class VideoGenerationEngine:
             return callback_kwargs
 
         if progress_callback is not None:
-            progress_callback(0.1, desc="Encoding prompt & starting diffusion...")
+            progress_callback(0.1, desc="Encoding prompt on GPU...")
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # If text_encoder is still on CPU while transformer is on CUDA (Colab Low-RAM split mode),
-        # encode the prompt first on GPU/CPU or temporarily move text_encoder to GPU if VRAM allows.
         pipe_kwargs = dict(
             height=effective_height,
             width=effective_width,
@@ -301,39 +336,22 @@ class VideoGenerationEngine:
         )
 
         with torch.inference_mode():
-            if (
-                self.device == "cuda"
-                and hasattr(pipe, "text_encoder")
-                and pipe.text_encoder is not None
-                and pipe.text_encoder.device.type == "cpu"
-                and not hasattr(pipe, "_all_hooks")
-            ):
-                # Temporarily move text_encoder to GPU (9.5 GB + 3.1 GB = 12.6 GB < 14.6 GB T4 VRAM),
-                # encode prompt embeddings at GPU speed, then immediately return text_encoder to CPU!
-                try:
-                    pipe.text_encoder.to("cuda")
-                    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
-                        prompt=prompt.strip(),
-                        negative_prompt=effective_neg_prompt,
-                        do_classifier_free_guidance=float(guidance_scale) > 1.0,
-                        device=torch.device("cuda"),
-                        dtype=self.dtype,
-                    )
-                    pipe.text_encoder.to("cpu")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    pipe_kwargs["prompt_embeds"] = prompt_embeds
-                    pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
-                except Exception as exc:
-                    logger.warning("Fast GPU prompt encode fallback (%s); encoding via standard call.", exc)
-                    pipe.text_encoder.to("cpu")
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    pipe_kwargs["prompt"] = prompt.strip()
-                    pipe_kwargs["negative_prompt"] = effective_neg_prompt
+            if self.device == "cuda" and self.low_system_ram:
+                prompt_embeds, negative_prompt_embeds = self._encode_prompt_low_ram(
+                    pipe=pipe,
+                    spec=spec,
+                    prompt=prompt.strip(),
+                    negative_prompt=effective_neg_prompt,
+                    guidance_scale=float(guidance_scale),
+                )
+                pipe_kwargs["prompt_embeds"] = prompt_embeds
+                pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
             else:
                 pipe_kwargs["prompt"] = prompt.strip()
                 pipe_kwargs["negative_prompt"] = effective_neg_prompt
+
+            if progress_callback is not None:
+                progress_callback(0.15, desc=f"Starting {total_steps} denoising steps...")
 
             result = pipe(**pipe_kwargs)
 
