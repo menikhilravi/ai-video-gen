@@ -100,7 +100,7 @@ def run_generation_pipeline(
 def build_ui() -> gr.Blocks:
     model_choices = list(MODEL_REGISTRY.keys())
 
-    with gr.Blocks(title="Zero-Cost AI Video Studio", analytics_enabled=False) as demo:
+    with gr.Blocks(title="Zero-Cost AI Video Studio") as demo:
         gr.Markdown(
             """
             # Zero-Cost AI Video Studio
@@ -283,5 +283,4 @@ if __name__ == "__main__":
         server_port=args.port,
         share=args.share,
         auth=auth_tuple,
-        show_api=False,
     )
