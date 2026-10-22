@@ -35,10 +35,14 @@ class SceneDirector:
         """
         Zero-cost, zero-API-key local prompt optimizer:
         1. Strips conversational filler ("Can you generate a video for...", "Please make a video of...")
-        2. Rewrites multi-era biographical prompts ("born in X and grew to be Y") into a single
-           coherent visual shot so the 3-second diffusion model doesn't mash two eras together.
+        2. Supports multi-shot sequences separated by "||" (or automatically splits biographical
+           "born in X ... grew to be Y in Z" prompts into a 2-shot story!).
         3. Appends cinematic lighting, camera motion, and photorealistic quality cues.
         """
+        if "||" in prompt:
+            parts = [p.strip() for p in prompt.split("||") if p.strip()]
+            return " || ".join(SceneDirector._rewrite_single_shot(p) for p in parts)
+
         cleaned = re.sub(
             r"^(can you |could you |please )?(generate|create|make|render|produce|show)( me)?( a)?( video| clip| animation| movie)?( of| for| about| showing| where)?\s*:?\s*",
             "",
@@ -46,7 +50,7 @@ class SceneDirector:
             flags=re.IGNORECASE,
         ).strip()
 
-        # Detect biographical "born in X ... grew/became Y in Z" patterns that confuse 3-second video diffusion
+        # Detect biographical "born in X ... grew/became Y in Z" patterns -> turn into a 2-shot story (Shot 1: Origin, Shot 2: Destination)!
         bio_match = re.search(
             r"person born in ([^,]+(?:,\s*[^,]+)?).*?(?:grew|became|working|works).*?to be (?:a |an )?([^,.]+?) in ([A-Za-z\s]+)",
             cleaned,
@@ -58,14 +62,22 @@ class SceneDirector:
                 bio_match.group(2).strip(),
                 bio_match.group(3).strip(),
             )
-            cleaned = (
-                f"Cinematic medium close-up shot of an Indian {role} originally from {origin}, "
-                f"standing inside a modern glass high-rise office in {city} with a glowing laptop, "
-                f"looking out at the breathtaking {city} skyline at twilight, subtle warm smile, "
-                f"gentle head turn as city lights shimmer in the background"
+            shot1 = (
+                f"Cinematic golden hour tracking shot of a young Indian student in {origin}, "
+                f"walking along a sunlit scenic street lined with lush green trees and traditional architecture, "
+                f"carrying a notebook with an inspired, determined expression, warm sunlight, 35mm film lens, photorealistic 4k"
             )
+            shot2 = (
+                f"Cinematic medium shot of an accomplished Indian {role} inside a sleek modern glass skyscraper office in {city}, "
+                f"typing on a laptop and looking out at the towering {city} skyline at twilight, "
+                f"glowing city lights reflecting on glass, smooth dolly in, shallow depth of field, photorealistic 4k"
+            )
+            return f"{shot1} || {shot2}"
 
-        # Ensure cinematic camera & lighting descriptors are present
+        return SceneDirector._rewrite_single_shot(cleaned)
+
+    @staticmethod
+    def _rewrite_single_shot(cleaned: str) -> str:
         lower = cleaned.lower()
         additions = []
         if not any(k in lower for k in ["shot", "camera", "dolly", "pan", "tracking", "close-up"]):

@@ -26,9 +26,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RESOLUTION_PRESETS = {
-    "480x272 (16:9 Low VRAM - Default)": (480, 272),
-    "512x320 (16:10 Low VRAM)": (512, 320),
-    "640x384 (Balanced)": (640, 384),
+    "832x480 (16:9 Native 480p HD - Best Quality)": (832, 480),
+    "640x384 (16:10 Balanced)": (640, 384),
+    "512x320 (16:10 Fast)": (512, 320),
+    "480x272 (16:9 Ultra-Fast Draft)": (480, 272),
     "Custom": None,
 }
 
@@ -126,39 +127,39 @@ def build_ui() -> gr.Blocks:
                     gr.Markdown("### Generation Parameters")
                     res_preset = gr.Dropdown(
                         choices=list(RESOLUTION_PRESETS.keys()),
-                        value="480x272 (16:9 Low VRAM - Default)",
-                        label="Resolution Preset",
+                        value="832x480 (16:9 Native 480p HD - Best Quality)",
+                        label="Resolution Preset (Wan2.1 is trained natively at 832x480)",
                     )
                     with gr.Row():
                         width_slider = gr.Slider(
                             minimum=256,
                             maximum=832,
                             step=16,
-                            value=480,
+                            value=832,
                             label="Width (px)",
                         )
                         height_slider = gr.Slider(
                             minimum=256,
                             maximum=480,
                             step=16,
-                            value=272,
+                            value=480,
                             label="Height (px)",
                         )
 
                     with gr.Row():
                         frames_slider = gr.Slider(
-                            minimum=9,
-                            maximum=49,
-                            step=1,
-                            value=25,
-                            label="Frame Count (16 or 25 recommended)",
+                            minimum=17,
+                            maximum=81,
+                            step=4,
+                            value=49,
+                            label="Frames Per Shot (49 = ~3s, 81 = ~5s per shot)",
                         )
                         fps_slider = gr.Slider(
-                            minimum=4,
+                            minimum=8,
                             maximum=24,
                             step=1,
-                            value=15,
-                            label="FPS (15-16 native for Wan2.1)",
+                            value=16,
+                            label="FPS (16 is Wan2.1 native)",
                         )
 
                     with gr.Row():

@@ -275,15 +275,47 @@ class VideoGenerationEngine:
 
         return prompt_embeds, negative_prompt_embeds
 
+    @staticmethod
+    def _export_high_quality_mp4(frames, output_path: str, fps: int) -> None:
+        """
+        Exports frames using libx264 with CRF 18 (visually lossless, high bitrate)
+        instead of diffusers' default export_to_video (which uses low default bitrate
+        and creates heavy macroblocking artifacts).
+        """
+        try:
+            import imageio
+            import numpy as np
+
+            writer = imageio.get_writer(
+                output_path,
+                fps=int(fps),
+                codec="libx264",
+                quality=None,
+                pixelformat="yuv420p",
+                ffmpeg_params=["-crf", "18", "-preset", "medium"],
+            )
+            for frame in frames:
+                if hasattr(frame, "convert"):
+                    arr = np.array(frame.convert("RGB"), dtype=np.uint8)
+                else:
+                    arr = np.asarray(frame)
+                    if arr.dtype != np.uint8:
+                        arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+                writer.append_data(arr)
+            writer.close()
+        except Exception as exc:
+            logger.warning("High-bitrate imageio writer fallback (%s); using export_to_video.", exc)
+            export_to_video(frames, output_video_path=output_path, fps=int(fps))
+
     def generate_video(
         self,
         prompt: str,
         model_key: str = "Wan2.1-1.3B-T2V",
-        num_frames: int = 25,
-        width: int = 480,
-        height: int = 272,
-        num_inference_steps: int = 20,
-        fps: int = 8,
+        num_frames: int = 81,
+        width: int = 832,
+        height: int = 480,
+        num_inference_steps: int = 30,
+        fps: int = 16,
         guidance_scale: float = 5.0,
         negative_prompt: Optional[str] = None,
         seed: int = -1,
@@ -291,8 +323,8 @@ class VideoGenerationEngine:
         progress_callback=None,
     ) -> Tuple[str, Dict[str, int]]:
         """
-        Generates a video clip from text and exports frames directly to an .mp4 file.
-        Returns the path to the generated .mp4 file and a metadata dictionary of effective dimensions.
+        Generates a video clip (or multi-shot stitched sequence if prompt contains multiple
+        scenes separated by '|') and exports frames to a high-bitrate .mp4 file.
         """
         if not prompt or not prompt.strip():
             raise ValueError("Please provide a non-empty scene description prompt.")
@@ -311,82 +343,105 @@ class VideoGenerationEngine:
             else spec.default_negative_prompt
         )
 
-        generator = None
-        if seed is not None and int(seed) >= 0:
-            gen_device = "cuda" if self.device == "cuda" else "cpu"
-            generator = torch.Generator(device=gen_device).manual_seed(int(seed))
-
-        logger.info(
-            "Generating video | model=%s | res=%dx%d | frames=%d | steps=%d | fps=%d",
-            model_key,
-            effective_width,
-            effective_height,
-            effective_frames,
-            num_inference_steps,
-            fps,
-        )
-
+        # Support multi-shot prompts separated by "||" for 10-15 second stories
+        shot_prompts = [p.strip() for p in prompt.split("||") if p.strip()]
+        num_shots = len(shot_prompts)
         total_steps = int(num_inference_steps)
 
-        def _on_step_end(_pipe, step_index: int, _timestep, callback_kwargs):
+        all_frames = []
+
+        for shot_idx, shot_prompt in enumerate(shot_prompts):
+            shot_prefix = f"[Shot {shot_idx + 1}/{num_shots}] " if num_shots > 1 else ""
+
+            generator = None
+            if seed is not None and int(seed) >= 0:
+                gen_device = "cuda" if self.device == "cuda" else "cpu"
+                generator = torch.Generator(device=gen_device).manual_seed(int(seed) + shot_idx)
+
+            logger.info(
+                "%sGenerating video | model=%s | res=%dx%d | frames=%d | steps=%d | fps=%d",
+                shot_prefix,
+                model_key,
+                effective_width,
+                effective_height,
+                effective_frames,
+                total_steps,
+                fps,
+            )
+
+            def _on_step_end(_pipe, step_index: int, _timestep, callback_kwargs):
+                if progress_callback is not None:
+                    shot_base = shot_idx / num_shots
+                    shot_span = 0.85 / num_shots
+                    frac = 0.10 + shot_base * 0.85 + shot_span * ((step_index + 1) / max(1, total_steps))
+                    progress_callback(
+                        min(0.94, frac),
+                        desc=f"{shot_prefix}Denoising step {step_index + 1}/{total_steps}...",
+                    )
+                return callback_kwargs
+
             if progress_callback is not None:
-                frac = 0.15 + 0.75 * ((step_index + 1) / max(1, total_steps))
                 progress_callback(
-                    min(0.92, frac),
-                    desc=f"Denoising step {step_index + 1}/{total_steps}...",
+                    0.08 + (shot_idx / num_shots) * 0.85,
+                    desc=f"{shot_prefix}Encoding prompt on GPU...",
                 )
-            return callback_kwargs
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            pipe_kwargs = dict(
+                height=effective_height,
+                width=effective_width,
+                num_frames=effective_frames,
+                num_inference_steps=total_steps,
+                guidance_scale=float(guidance_scale),
+                generator=generator,
+                callback_on_step_end=_on_step_end,
+            )
+
+            with torch.inference_mode():
+                if self.device == "cuda" and self.low_system_ram:
+                    prompt_embeds, negative_prompt_embeds = self._encode_prompt_low_ram(
+                        pipe=pipe,
+                        spec=spec,
+                        prompt=shot_prompt,
+                        negative_prompt=effective_neg_prompt,
+                        guidance_scale=float(guidance_scale),
+                    )
+                    pipe_kwargs["prompt_embeds"] = prompt_embeds
+                    pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+                else:
+                    pipe_kwargs["prompt"] = shot_prompt
+                    pipe_kwargs["negative_prompt"] = effective_neg_prompt
+
+                if progress_callback is not None:
+                    progress_callback(
+                        0.12 + (shot_idx / num_shots) * 0.85,
+                        desc=f"{shot_prefix}Starting {total_steps} denoising steps...",
+                    )
+
+                result = pipe(**pipe_kwargs)
+
+            shot_frames = list(result.frames[0])
+            all_frames.extend(shot_frames)
+            del result
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if progress_callback is not None:
-            progress_callback(0.1, desc="Encoding prompt on GPU...")
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        pipe_kwargs = dict(
-            height=effective_height,
-            width=effective_width,
-            num_frames=effective_frames,
-            num_inference_steps=total_steps,
-            guidance_scale=float(guidance_scale),
-            generator=generator,
-            callback_on_step_end=_on_step_end,
-        )
-
-        with torch.inference_mode():
-            if self.device == "cuda" and self.low_system_ram:
-                prompt_embeds, negative_prompt_embeds = self._encode_prompt_low_ram(
-                    pipe=pipe,
-                    spec=spec,
-                    prompt=prompt.strip(),
-                    negative_prompt=effective_neg_prompt,
-                    guidance_scale=float(guidance_scale),
-                )
-                pipe_kwargs["prompt_embeds"] = prompt_embeds
-                pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
-            else:
-                pipe_kwargs["prompt"] = prompt.strip()
-                pipe_kwargs["negative_prompt"] = effective_neg_prompt
-
-            if progress_callback is not None:
-                progress_callback(0.15, desc=f"Starting {total_steps} denoising steps...")
-
-            result = pipe(**pipe_kwargs)
-
-        frames = result.frames[0]
-
-        if progress_callback is not None:
-            progress_callback(0.95, desc="Encoding .mp4 video...")
+            progress_callback(0.96, desc="Encoding high-bitrate H.264 .mp4 video...")
 
         if output_path is None:
             tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
             output_path = tmp_file.name
             tmp_file.close()
 
-        export_to_video(frames, output_video_path=output_path, fps=int(fps))
+        self._export_high_quality_mp4(all_frames, output_path=output_path, fps=int(fps))
+        total_rendered_frames = len(all_frames)
 
-        del result, frames
+        del all_frames
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -397,8 +452,9 @@ class VideoGenerationEngine:
         metadata = {
             "width": effective_width,
             "height": effective_height,
-            "num_frames": effective_frames,
+            "num_frames": total_rendered_frames,
             "fps": int(fps),
             "steps": total_steps,
+            "shots": num_shots,
         }
         return output_path, metadata
