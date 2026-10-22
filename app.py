@@ -152,8 +152,8 @@ def build_ui() -> gr.Blocks:
                             minimum=4,
                             maximum=24,
                             step=1,
-                            value=8,
-                            label="FPS",
+                            value=15,
+                            label="FPS (15-16 native for Wan2.1)",
                         )
 
                     with gr.Row():
@@ -161,8 +161,8 @@ def build_ui() -> gr.Blocks:
                             minimum=10,
                             maximum=50,
                             step=1,
-                            value=20,
-                            label="Inference Steps",
+                            value=30,
+                            label="Inference Steps (30+ for crisp detail)",
                         )
                         guidance_slider = gr.Slider(
                             minimum=1.0,
@@ -178,11 +178,11 @@ def build_ui() -> gr.Blocks:
                         label="Seed (-1 for random)",
                     )
 
-                with gr.Accordion("LLM Scene Expander (Optional)", open=False):
+                with gr.Accordion("LLM Scene Expander (Optional)", open=True):
                     use_expander_toggle = gr.Checkbox(
-                        value=False,
+                        value=True,
                         label="Use LLM Scene Expander",
-                        info="Automatically enriches your prompt with cinematic lighting, camera movement, and motion cues. Falls back to raw prompt if no key is provided.",
+                        info="Automatically enriches your prompt with cinematic lighting, camera movement, and motion cues (includes built-in zero-key visual rewriter if no API key is entered).",
                     )
                     with gr.Row():
                         llm_provider_dropdown = gr.Dropdown(

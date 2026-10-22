@@ -33,8 +33,11 @@ class ModelSpec:
     spatial_multiple: int
     frame_divisor: int = 4  # temporal compression stride (4k + 1 or 8k + 1)
     default_negative_prompt: str = (
-        "low quality, worst quality, blurry, flickering, distorted, deformed, "
-        "watermark, text, static, overexposed, underexposed, compression artifacts"
+        "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+        "paintings, images, static, overall gray, worst quality, low quality, JPEG compression "
+        "residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, "
+        "deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, "
+        "three legs, many people in the background, walking backwards"
     )
 
 
@@ -147,7 +150,7 @@ class VideoGenerationEngine:
             # Colab Free Tier only provides ~12.7 GB System RAM, and Wan2.1's UMT5-XXL
             # text encoder alone is ~10-11 GB in fp16, which triggers the Linux OOM killer
             # if loaded into CPU RAM alongside Python/Gradio (~2 GB).
-            # Solution: Keep ONLY the lightweight DiT (2.8 GB) + VAE (0.3 GB) in the persistent
+            # Solution: Keep ONLY the lightweight DiT (2.8 GB) + VAE (0.5 GB) in the persistent
             # pipeline on T4 VRAM, and stream the text encoder directly onto T4 VRAM ONLY during
             # the 1-second prompt encoding step! Peak CPU RAM stays under ~2.5 GB!
             pipe = DiffusionPipeline.from_pretrained(
@@ -159,19 +162,35 @@ class VideoGenerationEngine:
             if hasattr(pipe, "transformer") and pipe.transformer is not None:
                 pipe.transformer.to("cuda")
             if hasattr(pipe, "vae") and pipe.vae is not None:
-                pipe.vae.to("cuda")
+                # CRITICAL for Wan2.1: The 3D Causal VAE MUST run in float32!
+                # Running Wan's VAE in float16 on T4 causes severe numerical overflow & mushy/corrupted video.
+                vae_dtype = torch.float32 if "Wan" in spec.repo_id else self.dtype
+                pipe.vae.to(device="cuda", dtype=vae_dtype)
         else:
             pipe = DiffusionPipeline.from_pretrained(
                 spec.repo_id,
                 torch_dtype=self.dtype,
                 low_cpu_mem_usage=True,
             )
+            if hasattr(pipe, "vae") and pipe.vae is not None and "Wan" in spec.repo_id:
+                pipe.vae.to(dtype=torch.float32)
             if self.device == "cuda":
                 pipe.enable_model_cpu_offload()
             elif self.device == "mps":
                 pipe.to("mps")
             else:
                 pipe.to("cpu")
+
+        # Configure UniPCMultistepScheduler with flow_shift=3.0 for 480p Wan2.1 generation
+        # (Default flow_shift=5.0 is tuned for 720p and causes over-sharpening/weird motion at 480p)
+        if "Wan" in spec.repo_id:
+            try:
+                from diffusers import UniPCMultistepScheduler
+                pipe.scheduler = UniPCMultistepScheduler.from_config(
+                    pipe.scheduler.config, flow_shift=3.0
+                )
+            except Exception as exc:
+                logger.warning("Could not set flow_shift=3.0 on scheduler: %s", exc)
 
         # Enable VAE slicing & tiling when supported by the pipeline/VAE
         if hasattr(pipe, "enable_vae_slicing"):

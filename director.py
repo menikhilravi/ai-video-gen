@@ -11,21 +11,73 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+import re
+
 DIRECTOR_SYSTEM_PROMPT = """You are an expert AI Video Director and Cinematographer specializing in latent video diffusion models (Wan2.1 and LTX-Video).
-Your task is to take a brief user concept and expand it into a single, cohesive, highly descriptive video generation prompt (60-110 words).
+Your task is to take a user concept (even if it describes a multi-year biography or abstract story) and translate it into ONE single, continuous 3-to-5-second cinematic camera shot (70-110 words).
 
 Follow these strict rules:
-1. Explicitly describe subject motion and temporal progression (what moves and how it moves from start to finish).
-2. Specify camera movement (e.g., slow dolly in, smooth tracking shot, low-angle pan, handheld cinematic movement, static tripod shot).
-3. Detail lighting, atmosphere, and visual style (e.g., volumetric golden hour lighting, anamorphic lens flare, shallow depth of field, 35mm film grain, photorealistic texture).
-4. Output ONLY the expanded prompt text. Do not include titles, quotes, markdown formatting, or explanations."""
+1. Diffusion models generate ONE continuous shot (3-5 seconds), NOT a multi-scene movie montage. Never write "First...", "Then...", or cut between childhood and adulthood in a single clip. If the user describes a life journey (e.g., born in India -> software engineer in NYC), synthesize it into one evocative cinematic moment (e.g., an Indian software engineer in a modern high-rise Manhattan office looking out over the glowing New York City skyline at dusk, warm golden reflections on the glass, coding on a sleek laptop).
+2. Strip any conversational prefixes like "Can you generate a video of...".
+3. Explicitly describe physical subject motion and camera movement (e.g., slow cinematic dolly in, smooth tracking shot, shallow depth of field).
+4. Detail lighting, atmosphere, and visual style (e.g., volumetric golden hour lighting, anamorphic lens, 35mm film grain, photorealistic 4k cinematography).
+5. Output ONLY the expanded prompt text. Do not include titles, quotes, markdown formatting, or explanations."""
 
 
 class SceneDirector:
-    """Lightweight multi-provider LLM client via httpx with automatic fallback."""
+    """Lightweight multi-provider LLM client via httpx with automatic local visual fallback."""
 
     def __init__(self, timeout: float = 20.0):
         self.timeout = timeout
+
+    @staticmethod
+    def _local_cinematic_rewrite(prompt: str) -> str:
+        """
+        Zero-cost, zero-API-key local prompt optimizer:
+        1. Strips conversational filler ("Can you generate a video for...", "Please make a video of...")
+        2. Rewrites multi-era biographical prompts ("born in X and grew to be Y") into a single
+           coherent visual shot so the 3-second diffusion model doesn't mash two eras together.
+        3. Appends cinematic lighting, camera motion, and photorealistic quality cues.
+        """
+        cleaned = re.sub(
+            r"^(can you |could you |please )?(generate|create|make|render|produce|show)( me)?( a)?( video| clip| animation| movie)?( of| for| about| showing| where)?\s*:?\s*",
+            "",
+            prompt.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Detect biographical "born in X ... grew/became Y in Z" patterns that confuse 3-second video diffusion
+        bio_match = re.search(
+            r"person born in ([^,]+(?:,\s*[^,]+)?).*?(?:grew|became|working|works).*?to be (?:a |an )?([^,.]+?) in ([A-Za-z\s]+)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if bio_match:
+            origin, role, city = (
+                bio_match.group(1).strip(),
+                bio_match.group(2).strip(),
+                bio_match.group(3).strip(),
+            )
+            cleaned = (
+                f"Cinematic medium close-up shot of an Indian {role} originally from {origin}, "
+                f"standing inside a modern glass high-rise office in {city} with a glowing laptop, "
+                f"looking out at the breathtaking {city} skyline at twilight, subtle warm smile, "
+                f"gentle head turn as city lights shimmer in the background"
+            )
+
+        # Ensure cinematic camera & lighting descriptors are present
+        lower = cleaned.lower()
+        additions = []
+        if not any(k in lower for k in ["shot", "camera", "dolly", "pan", "tracking", "close-up"]):
+            additions.append("smooth cinematic tracking shot, shallow depth of field, 35mm anamorphic lens")
+        if not any(k in lower for k in ["lighting", "light", "golden hour", "neon", "twilight", "sunlight"]):
+            additions.append("natural volumetric lighting, rich color grading")
+        if not any(k in lower for k in ["photorealistic", "4k", "8k", "cinematic", "film"]):
+            additions.append("photorealistic, ultra-detailed texture, smooth natural motion")
+
+        if additions:
+            cleaned = f"{cleaned.rstrip('. ')}, {', '.join(additions)}."
+        return cleaned
 
     def enhance_prompt(
         self,
@@ -38,17 +90,20 @@ class SceneDirector:
     ) -> str:
         """
         Expands a user prompt into a detailed video generation prompt.
-        Falls back cleanly to the original prompt if disabled, missing an API key,
-        or if the upstream API request fails.
+        Always cleans conversational prefixes; uses upstream LLM if enabled + key provided,
+        or falls back to the built-in local cinematic rewriter.
         """
         cleaned_prompt = (prompt or "").strip()
-        if not cleaned_prompt or not use_enhancer:
+        if not cleaned_prompt:
             return cleaned_prompt
+
+        if not use_enhancer:
+            return self._local_cinematic_rewrite(cleaned_prompt)
 
         resolved_key = (api_key or "").strip() or self._get_env_api_key(provider)
         if not resolved_key:
-            logger.info("No API key provided for SceneDirector; using raw prompt passthrough.")
-            return cleaned_prompt
+            logger.info("No API key provided for SceneDirector; using built-in local cinematic rewriter.")
+            return self._local_cinematic_rewrite(cleaned_prompt)
 
         resolved_provider = self._detect_provider(resolved_key, provider, base_url)
 
@@ -65,9 +120,9 @@ class SceneDirector:
             if expanded and expanded.strip():
                 return expanded.strip()
         except Exception as exc:
-            logger.warning("SceneDirector expansion failed (%s). Falling back to raw prompt.", exc)
+            logger.warning("SceneDirector expansion failed (%s). Falling back to local cinematic rewriter.", exc)
 
-        return cleaned_prompt
+        return self._local_cinematic_rewrite(cleaned_prompt)
 
     @staticmethod
     def _get_env_api_key(provider: str) -> str:
