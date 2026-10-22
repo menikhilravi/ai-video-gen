@@ -1,23 +1,23 @@
 """
-LLM Story/Scene Enhancer (director.py)
-Expands high-level user prompts into rich video diffusion prompts with explicit
-camera movement, lighting, atmosphere, and temporal motion cues.
+LLM Story/Scene & Foley Enhancer (director.py)
+Expands high-level user prompts into:
+1. Rich visual prompts for Stage 1 (Keyframe) & Stage 2 (I2V / T2V Animation).
+2. Acoustic Foley & ambient sound effect prompts for Stage 3 (AudioLDM 2 / AudioGen).
 """
 
 import logging
 import os
+import re
 from typing import Optional
 import httpx
 
 logger = logging.getLogger(__name__)
 
-import re
-
-DIRECTOR_SYSTEM_PROMPT = """You are an expert AI Video Director and Cinematographer specializing in latent video diffusion models (Wan2.1 and LTX-Video).
-Your task is to take a user concept (even if it describes a multi-year biography or abstract story) and translate it into ONE single, continuous 3-to-5-second cinematic camera shot (70-110 words).
+DIRECTOR_SYSTEM_PROMPT = """You are an expert AI Video Director and Cinematographer specializing in latent video diffusion models (FLUX, SDXL, Wan2.1, and LTX-Video).
+Your task is to take a user concept and translate it into ONE single, continuous 3-to-5-second cinematic camera shot (70-110 words).
 
 Follow these strict rules:
-1. Diffusion models generate ONE continuous shot (3-5 seconds), NOT a multi-scene movie montage. Never write "First...", "Then...", or cut between childhood and adulthood in a single clip. If the user describes a life journey (e.g., born in India -> software engineer in NYC), synthesize it into one evocative cinematic moment (e.g., an Indian software engineer in a modern high-rise Manhattan office looking out over the glowing New York City skyline at dusk, warm golden reflections on the glass, coding on a sleek laptop).
+1. Diffusion models generate ONE continuous shot (3-5 seconds), NOT a multi-scene movie montage. Never write "First...", "Then...", or cut between childhood and adulthood in a single clip.
 2. Strip any conversational prefixes like "Can you generate a video of...".
 3. Explicitly describe physical subject motion and camera movement (e.g., slow cinematic dolly in, smooth tracking shot, shallow depth of field).
 4. Detail lighting, atmosphere, and visual style (e.g., volumetric golden hour lighting, anamorphic lens, 35mm film grain, photorealistic 4k cinematography).
@@ -25,7 +25,7 @@ Follow these strict rules:
 
 
 class SceneDirector:
-    """Lightweight multi-provider LLM client via httpx with automatic local visual fallback."""
+    """Lightweight multi-provider LLM client via httpx with automatic local visual & audio fallback."""
 
     def __init__(self, timeout: float = 20.0):
         self.timeout = timeout
@@ -36,7 +36,7 @@ class SceneDirector:
         Zero-cost, zero-API-key local prompt optimizer:
         1. Strips conversational filler ("Can you generate a video for...", "Please make a video of...")
         2. Supports multi-shot sequences separated by "||" (or automatically splits biographical
-           "born in X ... grew to be Y in Z" prompts into a 2-shot story!).
+           "born in X ... grew to be Y in Z" prompts into a 2-shot story).
         3. Appends cinematic lighting, camera motion, and photorealistic quality cues.
         """
         if "||" in prompt:
@@ -50,7 +50,6 @@ class SceneDirector:
             flags=re.IGNORECASE,
         ).strip()
 
-        # Detect biographical "born in X ... grew/became Y in Z" patterns -> turn into a 2-shot story (Shot 1: Origin, Shot 2: Destination)!
         bio_match = re.search(
             r"person born in ([^,]+(?:,\s*[^,]+)?).*?(?:grew|became|working|works).*?to be (?:a |an )?([^,.]+?) in ([A-Za-z\s]+)",
             cleaned,
@@ -90,6 +89,48 @@ class SceneDirector:
         if additions:
             cleaned = f"{cleaned.rstrip('. ')}, {', '.join(additions)}."
         return cleaned
+
+    @staticmethod
+    def derive_audio_prompt(visual_prompt: str, custom_audio_prompt: Optional[str] = None) -> str:
+        """
+        Derives an optimized Foley / ambient soundscape prompt for AudioLDM 2 from the visual prompt
+        whenever the user leaves the secondary audio prompt blank.
+        """
+        if custom_audio_prompt and custom_audio_prompt.strip():
+            return custom_audio_prompt.strip()
+
+        lower = (visual_prompt or "").lower()
+        cues = []
+
+        if any(w in lower for w in ["beach", "ocean", "sea", "wave", "coast", "shore"]):
+            cues.append("gentle ocean waves washing onto shore, coastal breeze")
+        if any(w in lower for w in ["rain", "storm", "thunder", "wet", "downpour"]):
+            cues.append("steady rainfall pattering on surfaces, distant soft thunder")
+        if any(w in lower for w in ["city", "nyc", "manhattan", "skyscraper", "street", "traffic", "urban"]):
+            cues.append("subtle urban city ambience, distant traffic hum, soft indoor room tone")
+        if any(w in lower for w in ["office", "laptop", "typing", "coding", "engineer", "desk", "computer"]):
+            cues.append("soft mechanical keyboard typing clicks, quiet modern office ambience")
+        if any(w in lower for w in ["forest", "tree", "jungle", "nature", "park", "orchard", "india", "village"]):
+            cues.append("gentle wind rustling through leaves, warm outdoor nature ambience, distant birds chirping")
+        if any(w in lower for w in ["walk", "walking", "footsteps", "running", "stepping"]):
+            cues.append("soft natural footsteps in rhythm")
+        if any(w in lower for w in ["fire", "campfire", "flame", "torch"]):
+            cues.append("warm crackling fire and glowing embers")
+        if any(w in lower for w in ["space", "astronaut", "alien", "sci-fi", "neon", "cyberpunk"]):
+            cues.append("deep atmospheric sci-fi synth drone, subtle futuristic hum")
+
+        if cues:
+            return f"High quality realistic Foley sound effects and ambient audio: {', '.join(cues)}, clear stereo recording."
+
+        # Clean visual camera jargon from fallback audio description
+        stripped = re.sub(
+            r"\b(cinematic|tracking shot|dolly in|close-up|medium shot|35mm|anamorphic|lens|photorealistic|4k|8k|shallow depth of field|volumetric lighting|color grading)\b",
+            "",
+            visual_prompt.split("||")[0],
+            flags=re.IGNORECASE,
+        )
+        stripped = re.sub(r"\s+", " ", stripped).strip(" ,.")
+        return f"Realistic ambient soundscape and natural Foley sound effects for: {stripped[:140]}, high fidelity audio."
 
     def enhance_prompt(
         self,
