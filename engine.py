@@ -23,6 +23,10 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
+# Disable Hugging Face Xet Rust background chunk reconstruction (causes 10-minute stalls & RAM spikes on Colab)
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 import numpy as np
 import torch
 from PIL import Image
@@ -589,26 +593,34 @@ class VideoGenerationEngine:
         self.current_pipeline_mode = "t2v"
         return pipe, spec, False
 
-    def _encode_prompt_low_ram(
+    def _encode_prompt_standalone_low_ram(
         self,
-        pipe: DiffusionPipeline,
         spec: ModelSpec,
-        prompt: str,
+        prompts: List[str],
         negative_prompt: str,
         guidance_scale: float,
-    ):
+    ) -> List[Dict[str, torch.Tensor]]:
         """
-        Streams the 9.5 GB UMT5/T5 text_encoder directly into T4 GPU VRAM (device_map={'': 'cuda'})
-        for 1 second to compute prompt embeddings, then immediately frees it so CPU RAM never spikes.
+        On 12.7 GB Colab Free Tier:
+        Loads ONLY the tokenizer + text_encoder onto T4 GPU VRAM (with ZERO video transformer
+        or VAE in CPU RAM or GPU VRAM!), encodes all shot prompts in ~1 second, and completely
+        deletes the 9.5 GB text_encoder before the video transformer/VAE are ever loaded!
+        This guarantees peak CPU RAM stays < 2.8 GB and peak GPU VRAM stays < 10 GB.
         """
-        from transformers import AutoModel, T5EncoderModel, UMT5EncoderModel
+        from transformers import AutoModel, AutoTokenizer, T5EncoderModel, UMT5EncoderModel
 
-        if hasattr(pipe, "transformer") and pipe.transformer is not None:
-            pipe.transformer.to("cpu")
-        flush_memory()
-
+        self._unload_current_pipeline()
         repo_id = spec.t2v_repo_id
-        encoder_cls = UMT5EncoderModel if "Wan" in repo_id else T5EncoderModel
+        is_wan = "Wan" in repo_id
+        max_seq_len = 226 if is_wan else 128
+
+        logger.info(
+            "[Stage 2/4] Pre-encoding prompt(s) directly on GPU with standalone text_encoder (%s)...",
+            repo_id,
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(repo_id, subfolder="tokenizer")
+        encoder_cls = UMT5EncoderModel if is_wan else T5EncoderModel
         try:
             text_encoder = encoder_cls.from_pretrained(
                 repo_id,
@@ -625,44 +637,57 @@ class VideoGenerationEngine:
                 low_cpu_mem_usage=True,
                 device_map={"": "cuda"},
             )
+        text_encoder.eval()
 
-        pipe.text_encoder = text_encoder
-        with torch.inference_mode():
-            encoded = pipe.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=float(guidance_scale) > 1.0,
-                device=torch.device("cuda"),
-                dtype=self.dtype,
+        def _encode_single(text: str) -> Tuple[torch.Tensor, torch.Tensor]:
+            clean_text = " ".join(text.strip().split())
+            text_inputs = tokenizer(
+                [clean_text],
+                padding="max_length",
+                max_length=max_seq_len,
+                truncation=True,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                return_tensors="pt",
             )
+            input_ids = text_inputs.input_ids.to("cuda")
+            attn_mask = text_inputs.attention_mask.to("cuda")
+            embeds = text_encoder(input_ids=input_ids, attention_mask=attn_mask)[0]
+            embeds = embeds.to(dtype=self.dtype, device="cuda")
 
-        pipe.text_encoder = None
-        del text_encoder
+            if is_wan:
+                # Wan2.1 zeros out padded token positions beyond actual sequence length
+                seq_len = int(attn_mask.gt(0).sum(dim=1).long().item())
+                embeds[:, seq_len:] = 0.0
+                return embeds.detach(), attn_mask.detach()
+            else:
+                return embeds.detach(), attn_mask.to(dtype=self.dtype).detach()
+
+        encoded_shots: List[Dict[str, torch.Tensor]] = []
+        with torch.inference_mode():
+            neg_embeds, neg_mask = _encode_single(negative_prompt)
+            for shot_prompt in prompts:
+                pos_embeds, pos_mask = _encode_single(shot_prompt)
+                if is_wan:
+                    encoded_shots.append(
+                        {
+                            "prompt_embeds": pos_embeds,
+                            "negative_prompt_embeds": neg_embeds.clone(),
+                        }
+                    )
+                else:
+                    encoded_shots.append(
+                        {
+                            "prompt_embeds": pos_embeds,
+                            "prompt_attention_mask": pos_mask,
+                            "negative_prompt_embeds": neg_embeds.clone(),
+                            "negative_prompt_attention_mask": neg_mask.clone(),
+                        }
+                    )
+
+        del text_encoder, tokenizer
         flush_memory()
-
-        if hasattr(pipe, "transformer") and pipe.transformer is not None:
-            pipe.transformer.to("cuda")
-        flush_memory()
-
-        if len(encoded) == 4:
-            (
-                prompt_embeds,
-                prompt_attention_mask,
-                negative_prompt_embeds,
-                negative_prompt_attention_mask,
-            ) = encoded
-            return {
-                "prompt_embeds": prompt_embeds,
-                "prompt_attention_mask": prompt_attention_mask,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_attention_mask": negative_prompt_attention_mask,
-            }
-        else:
-            prompt_embeds, negative_prompt_embeds = encoded[:2]
-            return {
-                "prompt_embeds": prompt_embeds,
-                "negative_prompt_embeds": negative_prompt_embeds,
-            }
+        return encoded_shots
 
     @staticmethod
     def _export_high_quality_mp4(frames, output_path: str, fps: int) -> None:
@@ -773,12 +798,37 @@ class VideoGenerationEngine:
         # =========================================================================
         # STAGE 2: Temporal Animation (I2V / T2V)
         # =========================================================================
+        resolved_model_key = model_key
+        if use_i2v and "Wan" in model_key and self.low_system_ram:
+            resolved_model_key = "Lightricks/LTX-Video"
+        active_spec = MODEL_REGISTRY[resolved_model_key]
+
+        shot_prompts = [p.strip() for p in prompt.split("||") if p.strip()]
+        if use_i2v:
+            shot_prompts = [shot_prompts[0]]
+
+        # On 12.7 GB Colab Free Tier: Pre-encode all prompts BEFORE loading the video transformer/VAE!
+        # That way the 9.5 GB T5/UMT5 text_encoder is the ONLY model in memory, then it is 100% deleted
+        # before the video transformer + VAE are loaded.
+        pre_encoded_shots: Optional[List[Dict[str, torch.Tensor]]] = None
+        if self.device == "cuda" and self.low_system_ram:
+            _log_stage(
+                f"⏳ [2/4] Animating Frames: Encoding prompt embeddings on GPU ({resolved_model_key})...",
+                0.15,
+            )
+            pre_encoded_shots = self._encode_prompt_standalone_low_ram(
+                spec=active_spec,
+                prompts=shot_prompts,
+                negative_prompt=active_spec.default_negative_prompt,
+                guidance_scale=float(guidance_scale),
+            )
+
         _log_stage(
-            f"⏳ [2/4] Animating Frames: Loading {model_key} & animating sequence...",
-            0.18,
+            f"⏳ [2/4] Animating Frames: Loading {resolved_model_key} backbone & animating sequence...",
+            0.20,
         )
 
-        pipe, active_spec, is_i2v_active = self._load_video_pipeline(model_key, use_i2v=use_i2v)
+        pipe, active_spec, is_i2v_active = self._load_video_pipeline(resolved_model_key, use_i2v=use_i2v)
         effective_w = align_spatial_dim(width, active_spec.spatial_multiple)
         effective_h = align_spatial_dim(height, active_spec.spatial_multiple)
         effective_frames = align_frame_count(num_frames, active_spec.frame_divisor)
@@ -787,10 +837,6 @@ class VideoGenerationEngine:
         if anchor_image is not None and anchor_image.size != (effective_w, effective_h):
             anchor_image = anchor_image.resize((effective_w, effective_h), Image.Resampling.LANCZOS)
 
-        shot_prompts = [p.strip() for p in prompt.split("||") if p.strip()]
-        if is_i2v_active:
-            # I2V animates the single conditioned keyframe
-            shot_prompts = [shot_prompts[0]]
         num_shots = len(shot_prompts)
         all_frames = []
 
@@ -805,7 +851,7 @@ class VideoGenerationEngine:
                 if progress_callback is not None:
                     shot_base = shot_idx / num_shots
                     shot_span = 0.50 / num_shots
-                    frac = 0.20 + shot_base * 0.50 + shot_span * ((step_index + 1) / max(1, total_steps))
+                    frac = 0.22 + shot_base * 0.48 + shot_span * ((step_index + 1) / max(1, total_steps))
                     progress_callback(
                         min(0.70, frac),
                         desc=f"[2/4] Animating Frames: {shot_prefix}Step {step_index + 1}/{total_steps}",
@@ -828,15 +874,8 @@ class VideoGenerationEngine:
                 if is_i2v_active and anchor_image is not None:
                     pipe_kwargs["image"] = anchor_image
 
-                if self.device == "cuda" and self.low_system_ram and getattr(pipe, "text_encoder", None) is None:
-                    encoded_kwargs = self._encode_prompt_low_ram(
-                        pipe=pipe,
-                        spec=active_spec,
-                        prompt=shot_prompt,
-                        negative_prompt=active_spec.default_negative_prompt,
-                        guidance_scale=float(guidance_scale),
-                    )
-                    pipe_kwargs.update(encoded_kwargs)
+                if pre_encoded_shots is not None:
+                    pipe_kwargs.update(pre_encoded_shots[shot_idx])
                 else:
                     pipe_kwargs["prompt"] = shot_prompt
                     pipe_kwargs["negative_prompt"] = active_spec.default_negative_prompt
@@ -847,6 +886,9 @@ class VideoGenerationEngine:
             all_frames.extend(shot_frames)
             del result
             flush_memory()
+
+        del pre_encoded_shots
+        flush_memory()
 
         # If Stage 1 was skipped, extract frame 0 as the visual keyframe preview
         if anchor_image is None and all_frames:

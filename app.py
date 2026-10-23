@@ -13,9 +13,11 @@ import os
 import time
 from typing import Optional, Tuple
 
-# Disable Gradio external telemetry & analytics pings
+# Disable Gradio external telemetry & Hugging Face Xet RAM-spiking chunk reconstruction
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 import gradio as gr
 from PIL import Image
