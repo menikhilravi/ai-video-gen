@@ -497,24 +497,8 @@ class VideoGenerationEngine:
                 "Wan2.1-I2V-14B exceeds 15GB T4 VRAM budget; routing I2V animation through "
                 "Lightricks/LTX-Video I2V pipeline (or Wan2.1-1.3B T2V)."
             )
-            try:
-                from diffusers import LTXImageToVideoPipeline
-
-                self._unload_current_pipeline()
-                i2v_spec = MODEL_REGISTRY["Lightricks/LTX-Video"]
-                pipe = LTXImageToVideoPipeline.from_pretrained(
-                    i2v_spec.i2v_repo_id,
-                    torch_dtype=self.dtype,
-                    low_cpu_mem_usage=True,
-                )
-                apply_memory_optimizations(pipe, self.device, low_ram=False)
-                self.pipe = pipe
-                self.current_model_key = "Lightricks/LTX-Video"
-                self.current_pipeline_mode = "i2v"
-                return pipe, i2v_spec, True
-            except Exception as exc:
-                logger.warning("LTX-I2V load fallback (%s); using Wan2.1-1.3B T2V backbone.", exc)
-                effective_i2v = False
+            model_key = "Lightricks/LTX-Video"
+            spec = MODEL_REGISTRY[model_key]
 
         mode_tag = "i2v" if effective_i2v else "t2v"
         if (
@@ -529,12 +513,34 @@ class VideoGenerationEngine:
         if effective_i2v and "LTX" in model_key:
             from diffusers import LTXImageToVideoPipeline
 
-            pipe = LTXImageToVideoPipeline.from_pretrained(
-                spec.i2v_repo_id,
-                torch_dtype=self.dtype,
-                low_cpu_mem_usage=True,
-            )
-            apply_memory_optimizations(pipe, self.device, low_ram=False)
+            if self.device == "cuda" and self.low_system_ram:
+                # CRITICAL on 12.7 GB Colab RAM: LTX-Video's T5-XXL text_encoder is 9.5 GB in fp16!
+                # Loading LTXImageToVideoPipeline with text_encoder in CPU RAM crashes the 12.7 GB host.
+                # Load WITHOUT text_encoder first and stream text_encoder directly onto GPU VRAM!
+                pipe = LTXImageToVideoPipeline.from_pretrained(
+                    spec.i2v_repo_id,
+                    text_encoder=None,
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                )
+                if hasattr(pipe, "transformer") and pipe.transformer is not None:
+                    pipe.transformer.to("cuda")
+                if hasattr(pipe, "vae") and pipe.vae is not None:
+                    pipe.vae.to("cuda")
+            else:
+                pipe = LTXImageToVideoPipeline.from_pretrained(
+                    spec.i2v_repo_id,
+                    torch_dtype=self.dtype,
+                    low_cpu_mem_usage=True,
+                )
+                apply_memory_optimizations(pipe, self.device, low_ram=False)
+
+            if hasattr(pipe, "enable_vae_slicing"):
+                pipe.enable_vae_slicing()
+            if hasattr(pipe, "enable_vae_tiling"):
+                pipe.enable_vae_tiling()
+
+            flush_memory()
             self.pipe = pipe
             self.current_model_key = model_key
             self.current_pipeline_mode = "i2v"
@@ -622,7 +628,7 @@ class VideoGenerationEngine:
 
         pipe.text_encoder = text_encoder
         with torch.inference_mode():
-            prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+            encoded = pipe.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=float(guidance_scale) > 1.0,
@@ -638,7 +644,25 @@ class VideoGenerationEngine:
             pipe.transformer.to("cuda")
         flush_memory()
 
-        return prompt_embeds, negative_prompt_embeds
+        if len(encoded) == 4:
+            (
+                prompt_embeds,
+                prompt_attention_mask,
+                negative_prompt_embeds,
+                negative_prompt_attention_mask,
+            ) = encoded
+            return {
+                "prompt_embeds": prompt_embeds,
+                "prompt_attention_mask": prompt_attention_mask,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "negative_prompt_attention_mask": negative_prompt_attention_mask,
+            }
+        else:
+            prompt_embeds, negative_prompt_embeds = encoded[:2]
+            return {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+            }
 
     @staticmethod
     def _export_high_quality_mp4(frames, output_path: str, fps: int) -> None:
@@ -803,18 +827,16 @@ class VideoGenerationEngine:
             with torch.inference_mode():
                 if is_i2v_active and anchor_image is not None:
                     pipe_kwargs["image"] = anchor_image
-                    pipe_kwargs["prompt"] = shot_prompt
-                    pipe_kwargs["negative_prompt"] = active_spec.default_negative_prompt
-                elif self.device == "cuda" and self.low_system_ram and getattr(pipe, "text_encoder", None) is None:
-                    prompt_embeds, negative_prompt_embeds = self._encode_prompt_low_ram(
+
+                if self.device == "cuda" and self.low_system_ram and getattr(pipe, "text_encoder", None) is None:
+                    encoded_kwargs = self._encode_prompt_low_ram(
                         pipe=pipe,
                         spec=active_spec,
                         prompt=shot_prompt,
                         negative_prompt=active_spec.default_negative_prompt,
                         guidance_scale=float(guidance_scale),
                     )
-                    pipe_kwargs["prompt_embeds"] = prompt_embeds
-                    pipe_kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+                    pipe_kwargs.update(encoded_kwargs)
                 else:
                     pipe_kwargs["prompt"] = shot_prompt
                     pipe_kwargs["negative_prompt"] = active_spec.default_negative_prompt
